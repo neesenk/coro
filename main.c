@@ -266,7 +266,7 @@ void client_main(void *argv)
 int main(int argc, char *argv[])
 {
     int i = 0;
-    coro_init();
+    coro_init(8 * 1024);
 
     beg = st_mstime();
     port = atoi(argv[2]);

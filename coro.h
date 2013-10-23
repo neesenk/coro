@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2013, Zhiyong Liu <NeeseNK at gmail dot com>
+ * All rights reserved.
+ */
+
 #ifndef __CORO_H__
 #define __CORO_H__
 #include <sys/types.h>
@@ -17,7 +22,7 @@ extern "C" {
     typedef struct coro coro_t;
 
     coro_t *coro_create(void (*start) (void *arg), void *arg);
-    int     coro_init(void);
+    int     coro_init(size_t stack_size);
     void    coro_cleanup(void);
     void    coro_exit(void);
     void    coro_yield(void);

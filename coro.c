@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2013, Zhiyong Liu <NeeseNK at gmail dot com>
+ * All rights reserved.
+ */
+
 #define _GNU_SOURCE
 #include <stdlib.h>
 #include <stddef.h>
@@ -47,7 +52,7 @@ struct pollctx {
 };
 
 struct fd_data { unsigned short events; struct pollctx *next; };
-struct fdset {
+struct event {
     int epfd;
     struct fd_data *fd_data;
     size_t fd_data_size;
@@ -62,7 +67,7 @@ struct coro_context {
     struct list runable;
     struct list zombie;
     struct heap timer;
-    struct fdset fdset;
+    struct event events;
     int run_count;
     int active_count;
     int stack_size;
@@ -73,12 +78,13 @@ struct coro_context {
 enum {ST_RUNNING=1, ST_RUNNABLE, ST_IOWAIT, ST_SLEEPING, ST_ZOMBIE};
 enum {FL_MAIN=1, FL_IDLE=2, FL_ON_SLEEPQ=4, FL_ON_RUNQ=8};
 
-static __thread struct coro_context  _local_context;
-static __thread coro_t             *_current_thread;
-#define CURRENT()   (_current_thread)
-#define LOCALCTX()  (&_local_context)
+static __thread struct coro_context *_local_context = NULL;
+static __thread coro_t              *_current_coro  = NULL;
+#define CURRENT()   (_current_coro)
+#define LOCAL()     (_local_context)
 
-static void add_to_runq(coro_t *coro);
+static void add_to_runq(struct coro_context *ctx, coro_t *coro);
+static coro_t *coro_create_impl(struct coro_context *ctx, void (*fn) (void *), void *arg);
 
 static uint64_t ustime(void)
 {
@@ -89,10 +95,10 @@ static uint64_t ustime(void)
 
 #define CHILD_INDEX(n)	 (((n) * 2) + 1)
 #define PARENT_INDEX(n)	 (((n) - 1) / 2)
-#define HEAP_SWAP(h,a,b) do {				                    \
-    coro_t *tmp = h->heaps[a];		                        \
-    h->heaps[a] = h->heaps[b], h->heaps[a]->heap_index = a;     \
-    h->heaps[b] = tmp, h->heaps[b]->heap_index = b;	            \
+#define HEAP_SWAP(h,a,b) do {				                        \
+    coro_t *tmp = (h)->heaps[a];		                            \
+    (h)->heaps[a] = (h)->heaps[b], (h)->heaps[a]->heap_index = a;   \
+    (h)->heaps[b] = tmp, (h)->heaps[b]->heap_index = b;	            \
 } while (0)
 
 static inline void heap_siftdown(struct heap *h, size_t pos)
@@ -172,18 +178,18 @@ static coro_t *timer_min(struct heap *h)
 static void timer_dispatch(struct heap *h)
 {
     coro_t *coro = NULL;
-
-    while ((coro = timer_min(h)) != NULL && coro->expires <= ustime()) {
-        assert(coro->flags & FL_ON_SLEEPQ && coro != LOCALCTX()->idle);
+    uint64_t now = ustime();
+    while ((coro = timer_min(h)) != NULL && coro->expires <= now) {
+        assert(coro->flags & FL_ON_SLEEPQ && coro != LOCAL()->idle);
         timer_del(h, coro);
-        add_to_runq(coro);
+        add_to_runq(LOCAL(), coro);
     }
 }
 
-static int fd_data_expand(struct fdset *self, int maxfd)
+static int fd_data_expand(struct event *self, int maxfd)
 {
     struct fd_data *ptr = NULL;
-    size_t n = self->fd_data_size;
+    size_t n = self->fd_data_size ? self->fd_data_size : 1;
     while (maxfd >= n)
         n <<= 1;
 
@@ -197,24 +203,7 @@ static int fd_data_expand(struct fdset *self, int maxfd)
     return 0;
 }
 
-static int fdset_init(void)
-{
-    struct fdset *self = &LOCALCTX()->fdset;
-    if ((self->epfd = epoll_create(4096)) < 0)
-        return -1;
-    fcntl(self->epfd, F_SETFD, FD_CLOEXEC);
-    self->fd_data_size = 4096;
-    self->fd_data = calloc(self->fd_data_size, sizeof(struct fd_data));
-    if (!self->fd_data) {
-        close(self->epfd);
-        self->epfd = -1;
-        return -1;
-    }
-
-    return 0;
-}
-
-static int fdset_set(struct fdset *self, int fd, int events)
+static int event_set(struct event *self, int fd, int events)
 {
     int old_events = 0;
 
@@ -227,7 +216,7 @@ static int fdset_set(struct fdset *self, int fd, int events)
     if (events != old_events) {
         struct epoll_event ev;
         int op = events ? (old_events ? EPOLL_CTL_MOD : EPOLL_CTL_ADD) : EPOLL_CTL_DEL;
-        ev.events = events|EPOLLET;
+        ev.events = events | EPOLLET; // Edge Triggered
         ev.data.fd = fd;
         if (epoll_ctl(self->epfd, op, fd, &ev) < 0) {
             self->fd_data[fd].events = old_events;
@@ -238,12 +227,12 @@ static int fdset_set(struct fdset *self, int fd, int events)
     return 0;
 }
 
-static void fdset_del(struct fdset *self, struct pollctx *pq)
+static void event_del(struct event *self, struct pollctx *pq)
 {
     struct pollctx **pn = NULL;
 
     assert(pq->fd < self->fd_data_size);
-    fdset_set(self, pq->fd, self->fd_data[pq->fd].events & ~pq->events);
+    event_set(self, pq->fd, self->fd_data[pq->fd].events & ~pq->events);
 
     for (pn = &self->fd_data[pq->fd].next; *pn; pn = &(*pn)->next) {
         if (*pn == pq) {
@@ -253,7 +242,7 @@ static void fdset_del(struct fdset *self, struct pollctx *pq)
     }
 }
 
-static int fdset_add(struct fdset *self, struct pollctx *pq)
+static int event_add(struct event *self, struct pollctx *pq)
 {
     if (pq->fd < 0 || !pq->events || (pq->events & ~(EPOLLIN|EPOLLOUT|EPOLLPRI))) {
         errno = EINVAL;
@@ -262,18 +251,18 @@ static int fdset_add(struct fdset *self, struct pollctx *pq)
 
     if (pq->fd >= self->fd_data_size && fd_data_expand(self, pq->fd) < 0)
         return -1;
-    if (fdset_set(self, pq->fd, self->fd_data[pq->fd].events | pq->events) < 0)
+    if (event_set(self, pq->fd, self->fd_data[pq->fd].events | pq->events) < 0)
         return -1;
     pq->next = self->fd_data[pq->fd].next, self->fd_data[pq->fd].next = pq;
     return 0;
 }
 
-static void fdset_dispatch(struct fdset *self, int max)
+static void event_dispatch(struct event *self, int max)
 {
     int timeout = 0, n = 0, i = 0;
 
-    if (!LIST_EMPTY(&LOCALCTX()->runable)) {
-        coro_t *min = timer_min(&LOCALCTX()->timer);
+    if (!LIST_EMPTY(&LOCAL()->runable)) {
+        coro_t *min = timer_min(&LOCAL()->timer);
         uint64_t now = ustime();
         if (min) {
             int mtimout = min->expires > now ? min->expires - now : -1;
@@ -306,8 +295,8 @@ static void fdset_dispatch(struct fdset *self, int max)
             pq->next = NULL;
 
             if (pq->coro->flags & FL_ON_SLEEPQ)
-                timer_del(&LOCALCTX()->timer, pq->coro);
-            add_to_runq(pq->coro);
+                timer_del(&LOCAL()->timer, pq->coro);
+            add_to_runq(LOCAL(), pq->coro);
         }
     }
 }
@@ -318,18 +307,18 @@ static void thread_main(void (*fn) (void *), void *arg)
 	coro_exit();
 }
 
-static void add_to_runq(coro_t *coro)
+static void add_to_runq(struct coro_context *ctx, coro_t *coro)
 {
     if (coro->flags & FL_ON_RUNQ)
         return;
 
     assert(coro->state != ST_ZOMBIE);
-    coro->state = ST_RUNNABLE;
     assert(LIST_EMPTY(&coro->links));
+    coro->state = ST_RUNNABLE;
 
-    LIST_ADD_TAIL(&coro->links, &LOCALCTX()->runable);
+    LIST_ADD_TAIL(&coro->links, &ctx->runable);
     coro->flags |= FL_ON_RUNQ;
-    LOCALCTX()->run_count++;
+    ctx->run_count++;
 }
 
 static void schedule(void)
@@ -338,15 +327,15 @@ static void schedule(void)
     coro_t *me = CURRENT(), *coro = NULL;
     uint64_t now = ustime();
 
-    if (!LIST_EMPTY(&LOCALCTX()->runable) && LOCALCTX()->runable.next != &me->links)
-        coro = container_of(coro_t, LOCALCTX()->runable.next, links);
+    if (!LIST_EMPTY(&LOCAL()->runable) && LOCAL()->runable.next != &me->links)
+        coro = container_of(coro_t, LOCAL()->runable.next, links);
     else
-        coro = LOCALCTX()->idle;
+        coro = LOCAL()->idle;
 
     if (coro->flags & FL_ON_RUNQ) {
         LIST_DEL(&coro->links);
         coro->flags &= ~FL_ON_RUNQ;
-        LOCALCTX()->run_count--;
+        LOCAL()->run_count--;
     }
 
     if (me == coro)
@@ -366,74 +355,97 @@ static void idle_main(void *arg)
     int ret = 0;
     for (;;) {
         coro_yield();
-        fdset_dispatch(&LOCALCTX()->fdset, 5000);
-        timer_dispatch(&LOCALCTX()->timer);
+        event_dispatch(&LOCAL()->events, 10000);
+        timer_dispatch(&LOCAL()->timer);
     }
 
-    ret = swapcontext(&CURRENT()->context, &LOCALCTX()->main->context);
+    ret = swapcontext(&CURRENT()->context, &LOCAL()->main->context);
     assert(ret != -1);
 }
 
 void coro_yield()
 {
-    add_to_runq(CURRENT());
+    add_to_runq(LOCAL(), CURRENT());
     schedule();
 }
 
-void coro_cleanup(void)
+static void coro_context_destroy(struct coro_context *ctx)
 {
     struct list *q = NULL, *s = NULL;
-    assert(LOCALCTX()->active_count == 0);
 
-    if (LOCALCTX()->idle)
-        free(LOCALCTX()->idle);
-    if (LOCALCTX()->main)
-        free(LOCALCTX()->main);
-    free(LOCALCTX()->timer.heaps);
-    free(LOCALCTX()->fdset.fd_data);
-    close(LOCALCTX()->fdset.epfd);
+    if (ctx->idle)
+        free(ctx->idle);
+    if (ctx->main)
+        free(ctx->main);
+    free(ctx->timer.heaps);
+    free(ctx->events.fd_data);
+    close(ctx->events.epfd);
 
-    for (q = LOCALCTX()->zombie.next; q != &LOCALCTX()->zombie; q = s) {
+    for (q = ctx->zombie.next; q != &ctx->zombie; q = s) {
         coro_t *coro = container_of(coro_t, q, links);
         s = coro->links.next;
         assert(coro->state == ST_ZOMBIE);
         free(coro);
     }
+    free(ctx);
 }
 
-int coro_init(void)
+void coro_cleanup(void)
 {
-    if (CURRENT() != NULL)
+    if (!LOCAL())
+        return;
+    assert(LOCAL()->active_count == 0);
+    coro_context_destroy(LOCAL());
+    LOCAL() = NULL;
+}
+
+int coro_init(size_t stack_size)
+{
+    struct coro_context *ctx = NULL;
+    if (LOCAL() != NULL)
         return 0;
-
-    memset(LOCALCTX(), 0, sizeof(*LOCALCTX()));
-
-    LIST_INIT(&LOCALCTX()->runable);
-    LIST_INIT(&LOCALCTX()->zombie);
-
-    LOCALCTX()->rcvtimeout = 1000000;
-    LOCALCTX()->sndtimeout = 1000000;
-    LOCALCTX()->stack_size = DEFAULT_STACK_SIZE;
-
-    if ((LOCALCTX()->timer.heaps = calloc(1024, sizeof(coro_t *))) == NULL)
-        return -1;
-    LOCALCTX()->timer.size = 1024;
-
-    if (fdset_init() != 0)
+    if ((ctx = calloc(1, sizeof(struct coro_context))) == NULL)
         return -1;
 
-    if (!(LOCALCTX()->idle = coro_create(idle_main, NULL)))
-        return -1;
-    LOCALCTX()->idle->flags |= FL_IDLE;
+    LIST_INIT(&ctx->runable);
+    LIST_INIT(&ctx->zombie);
 
-    if ((LOCALCTX()->main  = calloc(1, sizeof(coro_t))) == NULL)
-        return -1;
-    LIST_INIT(&LOCALCTX()->main->links);
-    LOCALCTX()->main->state = ST_RUNNING;
-    LOCALCTX()->main->flags = FL_MAIN;
-    CURRENT() = LOCALCTX()->main;
+    ctx->rcvtimeout = 1000000;
+    ctx->sndtimeout = 1000000;
+
+    if (stack_size > 8 * 1024 * 1024)
+        stack_size = 8 * 1024 * 1024;
+    ctx->stack_size = stack_size;
+
+    ctx->events.epfd = -1;
+    if ((ctx->timer.heaps = calloc(1024, sizeof(coro_t *))) == NULL)
+        goto ERROR;
+    ctx->timer.size = 1024;
+
+    if ((ctx->events.epfd = epoll_create(4096)) < 0)
+        goto ERROR;
+    fcntl(ctx->events.epfd, F_SETFD, FD_CLOEXEC);
+    if (fd_data_expand(&ctx->events, 4096) < 0)
+        goto ERROR;
+
+    if (!(ctx->idle = coro_create_impl(ctx, idle_main, NULL)))
+        goto ERROR;
+    ctx->idle->flags |= FL_IDLE;
+
+    if ((ctx->main = calloc(1, sizeof(coro_t))) == NULL)
+        goto ERROR;
+    LIST_INIT(&ctx->main->links);
+    ctx->main->state = ST_RUNNING;
+    ctx->main->flags = FL_MAIN;
+
+    ctx->active_count = 0;
+    CURRENT() = ctx->main;
+    LOCAL() = ctx;
 
     return 0;
+ERROR:
+    coro_context_destroy(ctx);
+    return -1;
 }
 
 void coro_exit(void)
@@ -442,9 +454,9 @@ void coro_exit(void)
 
     coro->state = ST_ZOMBIE;
     assert(coro->links.next == &coro->links);
-    LIST_ADD_TAIL(&coro->links, &LOCALCTX()->zombie);
+    LIST_ADD_TAIL(&coro->links, &LOCAL()->zombie);
 
-    LOCALCTX()->active_count--;
+    LOCAL()->active_count--;
 #ifdef VALGRIND
     if (!(coro->flags & FL_MAIN))
         VALGRIND_STACK_DEREGISTER(coro->vstackid);
@@ -452,17 +464,18 @@ void coro_exit(void)
     schedule();
 }
 
-coro_t *coro_create(void (*fn) (void *), void *arg)
+#define ROUNDUP(n, x) (((n) + (x) - 1) / (x))
+static coro_t *coro_create_impl(struct coro_context *ctx, void (*fn) (void *), void *arg)
 {
     coro_t *coro = NULL;
-    size_t n = 1 + (LOCALCTX()->stack_size + sizeof(coro_t) - 1) / sizeof(coro_t);
+    size_t cn = ROUNDUP(sizeof(coro_t), 1024);
+    size_t sn = ROUNDUP(ctx->stack_size, 1024);
 
-    assert(n > 1);
-    if (LIST_EMPTY(&LOCALCTX()->zombie)) { // 从zombie队列取一个
-        if ((coro = calloc(n, sizeof(*coro))) == NULL)
+    if (LIST_EMPTY(&ctx->zombie)) { // 从zombie队列取一个
+        if ((coro = (coro_t *)calloc(cn + sn, 1024)) == NULL)
             return NULL;
     } else {
-        coro = container_of(coro_t, LOCALCTX()->zombie.next, links);
+        coro = container_of(coro_t, ctx->zombie.next, links);
         assert(coro->state == ST_ZOMBIE);
         LIST_DEL(&coro->links);
     }
@@ -472,25 +485,33 @@ coro_t *coro_create(void (*fn) (void *), void *arg)
         return NULL;
     }
 
+    assert(ctx->idle == NULL || ctx->idle->context.uc_stack.ss_size == sn * 1024);
+
     LIST_INIT(&coro->links);
-    coro->context.uc_stack.ss_sp    = (char *)(coro + 1);
-    coro->context.uc_stack.ss_size  = LOCALCTX()->stack_size;
-    coro->context.uc_link           = &LOCALCTX()->idle->context;
+    coro->context.uc_stack.ss_sp    = (char *)coro + cn * 1024;
+    coro->context.uc_stack.ss_size  = sn * 1024;
+    coro->context.uc_link           = NULL;
     makecontext(&coro->context, (void (*)(void))thread_main, 2, fn, arg);
 #ifdef VALGRIND
     coro->vstackid = VALGRIND_STACK_REGISTER((void *)(coro+1), (void *)(coro+n));
 #endif
-    LOCALCTX()->active_count++;
-    add_to_runq(coro);
+    ctx->active_count++;
+    add_to_runq(ctx, coro);
 
     return coro;
+}
+
+coro_t *coro_create(void (*fn) (void *), void *arg)
+{
+    assert(LOCAL());
+    return coro_create_impl(LOCAL(), fn, arg);
 }
 
 int coro_sleep(int usec)
 {
     coro_t *me = CURRENT();
 	me->state = ST_SLEEPING;
-    timer_add(&LOCALCTX()->timer, me, usec);
+    timer_add(&LOCAL()->timer, me, usec);
 	schedule();
 
 	return 0;
@@ -501,14 +522,14 @@ int coro_poll(int fd, int events, int timeout)
     coro_t *me = CURRENT();
     struct pollctx ctx = {.coro=me, .fd=fd, .events=events, .revents=0, .is_wait=1};
 
-    if (fdset_add(&LOCALCTX()->fdset, &ctx) < 0)
+    if (event_add(&LOCAL()->events, &ctx) < 0)
         return -1;
     if (timeout >= 0)
-        timer_add(&LOCALCTX()->timer, me, timeout);
+        timer_add(&LOCAL()->timer, me, timeout);
 
     me->state = ST_IOWAIT;
     schedule();
-    fdset_del(&LOCALCTX()->fdset, &ctx);
+    event_del(&LOCAL()->events, &ctx);
 
     if (ctx.is_wait) {
         errno = ETIMEDOUT;
@@ -532,17 +553,17 @@ int coro_poll(int fd, int events, int timeout)
 
 void coro_set_rcvtimeout(size_t timeout)
 {
-    LOCALCTX()->rcvtimeout = timeout;
+    LOCAL()->rcvtimeout = timeout;
 }
 
 void coro_set_sndtimeout(size_t timeout)
 {
-    LOCALCTX()->sndtimeout = timeout;
+    LOCAL()->sndtimeout = timeout;
 }
 
 int coro_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
 {
-    NETOPT(accept4(fd, addr, addrlen, SOCK_NONBLOCK), EPOLLIN, LOCALCTX()->rcvtimeout);
+    NETOPT(accept4(fd, addr, addrlen, SOCK_NONBLOCK), EPOLLIN, LOCAL()->rcvtimeout);
 }
 
 int coro_connect(int fd, const struct sockaddr *addr, int addrlen)
@@ -552,7 +573,7 @@ int coro_connect(int fd, const struct sockaddr *addr, int addrlen)
         if (errno != EINTR) {
             if (errno != EINPROGRESS && (errno != EADDRINUSE || err == 0))
                 return -1;
-            if (coro_poll(fd, EPOLLOUT, LOCALCTX()->sndtimeout) < 0)
+            if (coro_poll(fd, EPOLLOUT, LOCAL()->sndtimeout) < 0)
                 return -1;
             n = sizeof(int);
             if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&err, (socklen_t *)&n) < 0)
@@ -571,7 +592,7 @@ int coro_connect(int fd, const struct sockaddr *addr, int addrlen)
 
 ssize_t coro_read(int fd, void *buf, size_t nbyte)
 {
-    NETOPT(read(fd, buf, nbyte), EPOLLIN, LOCALCTX()->rcvtimeout);
+    NETOPT(read(fd, buf, nbyte), EPOLLIN, LOCAL()->rcvtimeout);
 }
 
 ssize_t coro_read_fully(int fd, void *buf, size_t nbyte)
@@ -601,7 +622,7 @@ ssize_t coro_write(int fd, const void *buf, size_t nbyte)
                 continue;
             if (!NOT_READY_ERRNO)
                 return -1;
-            if (coro_poll(fd, EPOLLOUT, LOCALCTX()->sndtimeout) < 0)
+            if (coro_poll(fd, EPOLLOUT, LOCAL()->sndtimeout) < 0)
                 return -1;
         } else {
             writen += n;
@@ -613,30 +634,30 @@ ssize_t coro_write(int fd, const void *buf, size_t nbyte)
 
 ssize_t coro_recv(int fd, void *buf, size_t len, int flags)
 {
-    NETOPT(recv(fd, buf, len, flags), EPOLLIN, LOCALCTX()->rcvtimeout);
+    NETOPT(recv(fd, buf, len, flags), EPOLLIN, LOCAL()->rcvtimeout);
 }
 
 ssize_t coro_recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *from, socklen_t *fromlen)
 {
-    NETOPT(recvfrom(fd, buf, len, flags, from, fromlen), EPOLLIN, LOCALCTX()->rcvtimeout);
+    NETOPT(recvfrom(fd, buf, len, flags, from, fromlen), EPOLLIN, LOCAL()->rcvtimeout);
 }
 
 ssize_t coro_send(int fd, const void *buf, size_t len, int flags)
 {
-    NETOPT(send(fd, buf, len, flags), EPOLLOUT, LOCALCTX()->sndtimeout);
+    NETOPT(send(fd, buf, len, flags), EPOLLOUT, LOCAL()->sndtimeout);
 }
 
 ssize_t coro_sendto(int fd, const void *msg, size_t len, int flags, const struct sockaddr *to, socklen_t tolen)
 {
-    NETOPT(sendto(fd, msg, len, flags, to, tolen), EPOLLOUT, LOCALCTX()->sndtimeout);
+    NETOPT(sendto(fd, msg, len, flags, to, tolen), EPOLLOUT, LOCAL()->sndtimeout);
 }
 
 ssize_t coro_recvmsg(int fd, struct msghdr *msg, int flags)
 {
-    NETOPT(recvmsg(fd, msg, flags), EPOLLIN, LOCALCTX()->rcvtimeout);
+    NETOPT(recvmsg(fd, msg, flags), EPOLLIN, LOCAL()->rcvtimeout);
 }
 
 ssize_t coro_sendmsg(int fd, const struct msghdr *msg, int flags)
 {
-    NETOPT(sendmsg(fd, msg, flags), EPOLLOUT, LOCALCTX()->sndtimeout);
+    NETOPT(sendmsg(fd, msg, flags), EPOLLOUT, LOCAL()->sndtimeout);
 }
